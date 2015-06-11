@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -17,10 +18,11 @@ func genStubs(protoFile, outDir string) error {
 	} else {
 		return err
 	}
-	clientDir := fmt.Sprintf("%s%cclient", outDir, os.PathSeparator)
-	serverDir := fmt.Sprintf("%s%cserver", outDir, os.PathSeparator)
+	genDir := filepath.Join(outDir, "gen")
+	clientDir := filepath.Join(genDir, "client")
+	serverDir := filepath.Join(genDir, "server")
 
-	for _, v := range []string{clientDir, serverDir} {
+	for _, v := range []string{genDir, clientDir, serverDir} {
 		if _, err := os.Stat(v); err != nil {
 			if err := os.MkdirAll(v, 0755); err != nil {
 				return err
@@ -28,11 +30,7 @@ func genStubs(protoFile, outDir string) error {
 		}
 	}
 
-	if err := genClient(proto, clientDir); err != nil {
-		return err
-	}
-
-	return genServer(proto, serverDir)
+	return genIface(proto, genDir)
 }
 
 func goify(name string) string {
@@ -73,42 +71,46 @@ func makeArgs(args []Arg) string {
 func goType(arg Arg) string {
 	switch arg.Type {
 	case "int":
-		return "int32"
+		return "WlInt"
 	case "uint":
-		return "uint32"
+		return "WlUint"
 	case "fixed":
-		return "float32"
+		return "WlFixed"
 	case "fd":
-		return "uintptr"
+		return "WlFd"
 	case "new_id":
-		return "uint32"
+		return "WlNewId"
 	case "object":
-		return "uint32"
+		return "WlObject"
 	case "array":
-		return "[]byte"
+		return "WlArray"
+	case "string":
+		return "WlString"
 	default:
-		return arg.Type
+		panic("unknown arg type: " + arg.Type)
 	}
 }
 
-func genClient(proto Protocol, clientDir string) error {
+func genIface(proto Protocol, clientDir string) error {
 	for _, iface := range proto.Interfaces {
 		iFile, err := os.Create(fmt.Sprintf("%s%c%s.go", clientDir, os.PathSeparator, iface.Name))
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(iFile, "package client")
+		fmt.Fprintln(iFile, "package gen")
 		outputDesc(iFile, iface.Description)
-		fmt.Fprintf(iFile, "type %s struct{}\n", goify(iface.Name))
+		fmt.Fprintf(iFile, "type %s interface{\n", goify(iface.Name))
 
 		for _, v := range iface.Events {
 			outputDesc(iFile, v.Description)
-			fmt.Fprintf(iFile, "func (obj *%s) %s(%s) {}\n", goify(iface.Name), goify(v.Name), makeArgs(v.Args))
+			fmt.Fprintf(iFile, "%s(%s)\n", goify(v.Name), makeArgs(v.Args))
 		}
 		for _, v := range iface.Requests {
 			outputDesc(iFile, v.Description)
-			fmt.Fprintf(iFile, "func (obj *%s) %s(%s) {}\n", goify(iface.Name), goify(v.Name), makeArgs(v.Args))
+			fmt.Fprintf(iFile, "%s(%s)\n", goify(v.Name), makeArgs(v.Args))
 		}
+
+		fmt.Fprintln(iFile, "}")
 
 		for _, v := range iface.Enums {
 			outputDesc(iFile, v.Description)
@@ -125,8 +127,4 @@ func genClient(proto Protocol, clientDir string) error {
 	}
 
 	return nil
-}
-
-func genServer(proto Protocol, serverDir string) error {
-	return genClient(proto, serverDir)
 }

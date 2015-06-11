@@ -1,7 +1,6 @@
 package main
 
 var keywords = map[string]bool{
-
 	"break":       true,
 	"default":     true,
 	"func":        true,
