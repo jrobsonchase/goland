@@ -2,10 +2,11 @@ package gen
 
 import (
 	"errors"
+	"net"
 	"reflect"
 	"unsafe"
 
-	"github.com/davecgh/go-spew/spew"
+	"golang.org/x/sys/unix"
 )
 
 type WlHeader struct {
@@ -14,26 +15,35 @@ type WlHeader struct {
 	Size uint16
 }
 
-func ReadHeader(bs []byte) (WlHeader, []byte, error) {
+func parseHeader(bs []byte) (WlHeader, []byte, error) {
 	if len(bs) < 8 {
 		return WlHeader{}, nil, errors.New("ReadHeader: not enough data")
 	}
 
-	headerBytes := [8]byte{}
-	for i, v := range bs[:8] {
-		headerBytes[i] = v
-	}
+	headerBytes := bs[:8]
+	sliceHeader := (*reflect.SliceHeader)(unsafe.Pointer(&headerBytes))
 
-	return *(*WlHeader)(unsafe.Pointer(&headerBytes)), bs[8:], nil
+	return *(*WlHeader)(unsafe.Pointer(sliceHeader.Data)), bs[8:], nil
+}
+
+func marshHeader(head WlHeader) []byte {
+	bs := make([]byte, 8)
+	copy(bs, (*(*[8]byte)(unsafe.Pointer(&head)))[:])
+	return bs
 }
 
 type WlMessage struct {
 	WlHeader
-	Data []uint32
+	Data []byte
 }
 
-func ReadMessage(bs []byte) (msg WlMessage, rest []byte, err error) {
-	msg.WlHeader, _, err = ReadHeader(bs)
+type WlWireMessage struct {
+	Messages []WlMessage
+	FDs      []int
+}
+
+func parseOneMessage(bs []byte) (msg WlMessage, rest []byte, err error) {
+	msg.WlHeader, _, err = parseHeader(bs)
 	if err != nil {
 		return
 	}
@@ -41,15 +51,20 @@ func ReadMessage(bs []byte) (msg WlMessage, rest []byte, err error) {
 		err = errors.New("ReadMessage: actual size does not match header size")
 		return
 	}
-	msg.Data = make([]uint32, (msg.Size-8)/4)
-	header := (*reflect.SliceHeader)(unsafe.Pointer(&bs))
-	islice := *(*[]uint32)(unsafe.Pointer(header))
-	copy(msg.Data, islice[2:])
+	msg.Data = make([]byte, msg.Size-8)
+	copy(msg.Data, bs[8:])
 	rest = bs[msg.Size:]
 	return
 }
 
-func ParseMessages(bs []byte) ([]WlMessage, error) {
+func marshOneMessage(msg WlMessage) []byte {
+	bs := make([]byte, msg.Size)
+	copy(bs, marshHeader(msg.WlHeader))
+	copy(bs[8:], msg.Data)
+	return bs
+}
+
+func parseMessages(bs []byte) ([]WlMessage, error) {
 	var msgs []WlMessage
 	var msg WlMessage
 	var err error
@@ -57,12 +72,48 @@ func ParseMessages(bs []byte) ([]WlMessage, error) {
 		if len(bs) == 0 {
 			return msgs, nil
 		}
-		msg, bs, err = ReadMessage(bs)
+		msg, bs, err = parseOneMessage(bs)
 		if err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, msg)
 	}
+}
+
+func marshMessages(msgs []WlMessage) []byte {
+	var bs []byte
+	for _, v := range msgs {
+		bs = append(bs, marshOneMessage(v)...)
+	}
+	return bs
+}
+
+func parseFDs(oob []byte) ([]int, error) {
+	scms, err := unix.ParseSocketControlMessage(oob)
+	if err != nil {
+		return nil, err
+	}
+	fdss := make([][]int, len(scms))
+	total := 0
+	for i, v := range scms {
+		fdss[i], err = unix.ParseUnixRights(&v)
+		if err != nil {
+			return nil, err
+		}
+		total += len(fdss[i])
+	}
+	fds := make([]int, 0, total)
+	for _, v := range fdss {
+		for _, fd := range v {
+			fds = append(fds, fd)
+		}
+	}
+
+	return fds, nil
+}
+
+func marshFDs(fds []int) []byte {
+	return unix.UnixRights(fds...)
 }
 
 type (
@@ -76,42 +127,37 @@ type (
 	WlFd     uintptr
 )
 
-func StringArg(ws []uint32) WlString {
-	bs := make([]byte, len(ws)*4)
-	header := (*reflect.SliceHeader)(unsafe.Pointer(&ws))
-	copy(bs, *(*[]byte)(unsafe.Pointer(header)))
-	return WlString(bs)
-}
-func StringMsg(str WlString) []uint32 {
-	bs := []byte(str)
-	ws := make([]uint32, len(bs)/4)
-	header := (*reflect.SliceHeader)(unsafe.Pointer(&bs))
-	copy(ws, *(*[]uint32)(unsafe.Pointer(header)))
-	return ws
+type unixMsg struct {
+	pkt, oob []byte
 }
 
-func ArrayArg(ws []uint32) WlArray {
-	bs := make([]byte, ws[0])
-	header := (*reflect.SliceHeader)(unsafe.Pointer(&ws))
-	header.Len *= 4
-	header.Cap *= 4
-	copy(bs, (*(*[]byte)(unsafe.Pointer(header)))[4:])
-	return bs
-}
-
-func ArrayMsg(arr WlArray) []uint32 {
-	l := len(arr)
-	pad := 0
-	if l%4 != 0 {
-		arr = append(arr, make([]byte, 4-l%4)...)
-		pad = 1
+func ReadMsg(conn *net.UnixConn) (*WlWireMessage, error) {
+	pkt := make([]byte, 4096)
+	oob := make([]byte, 4096)
+	n, oobn, _, _, err := conn.ReadMsgUnix(pkt, oob)
+	if err != nil {
+		return nil, err
 	}
-	spew.Dump(arr)
-	ws := make([]uint32, l/4+pad+1)
-	ws[0] = uint32(l)
-	header := (*reflect.SliceHeader)(unsafe.Pointer(&arr))
-	header.Len /= 4
-	header.Cap /= 4
-	copy(ws[1:], *(*[]uint32)(unsafe.Pointer(header)))
-	return ws
+	pkt = pkt[:n]
+	oob = oob[:oobn]
+	msgs, err := parseMessages(pkt)
+	if err != nil {
+		return nil, err
+	}
+	fds, err := parseFDs(oob)
+	if err != nil {
+		return nil, err
+	}
+	return &WlWireMessage{
+		Messages: msgs,
+		FDs:      fds,
+	}, nil
+}
+
+func SendMsg(conn *net.UnixConn, wmsg *WlWireMessage) error {
+	_, _, err := conn.WriteMsgUnix(marshMessages(wmsg.Messages), marshFDs(wmsg.FDs), nil)
+	if err != nil {
+		return err
+	}
+	return nil
 }
